@@ -91,3 +91,32 @@ forwarded downstream. The orchestration Lambda uses a separate provider
 credential from Secrets Manager. A downstream `401` or `403` is returned to
 clients as a provider integration failure so internal credentials are not
 exposed.
+
+
+## Downstream OAuth2 client credentials
+
+The provider client can exchange a dedicated client credential for a short-lived
+OAuth2 bearer token. Set `DOWNSTREAM_AUTH_MODE=oauth2`,
+`DOWNSTREAM_OAUTH2_TOKEN_URL` (HTTPS) and `DOWNSTREAM_OAUTH2_SCOPE` (for the mock:
+`benefit-checks.assess`). `DOWNSTREAM_BASIC_AUTH_SECRET_ID` remains the existing
+secret reference for migration: its `username` holds the OAuth2 client ID and its
+`password` holds the client secret. Use a client registered for the downstream
+API, not the consumer's credential.
+
+The token endpoint uses `client_secret_basic`. Tokens are cached until 30 seconds
+before expiry and refreshed after a provider 401. A 403 is not retried. OAuth2
+failures never fall back to Basic. Redirects are disabled for token and provider
+requests to avoid forwarding credentials to a different destination. The existing
+Basic mode remains the default until the approved registration and deployment
+configuration are available.
+
+All 29 platform tests pass, including token exchange, expiry, invalid responses,
+credential rejection and bearer-authenticated provider calls. These are local
+mocked tests; they do not establish successful non-production OAuth2 deployment.
+The downstream mock companion change validates signed tokens and enforces its
+role/scope policy.
+
+Consumer-to-platform OAuth2, mTLS and full DWP/HMRC integration verification remain
+outstanding. The existing static bearer format is not OAuth2. Deployment requires
+an agreed provider/client registration, claim mapping and certificate ownership;
+this change alone does not complete the SOW.

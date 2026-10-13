@@ -12,6 +12,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -101,30 +102,89 @@ class SecretCredentialProvider:
         self._expires_at = 0.0
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class OAuthClientCredentialsProvider:
+    """Exchange a dedicated provider client credential for a short-lived access token."""
+
+    def __init__(self, token_url, scope, credentials, timeout=5.0, opener=None, clock=time.monotonic):
+        parsed = urllib.parse.urlsplit(token_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            raise ConfigurationError("OAuth token endpoint must be an HTTPS URL")
+        if not scope.strip():
+            raise ConfigurationError("OAuth scope is required")
+        self.token_url, self.scope, self.credentials = token_url, scope, credentials
+        self.timeout, self.clock = timeout, clock
+        self.opener = opener or urllib.request.build_opener(NoRedirect()).open
+        self._token, self._expires_at = None, 0.0
+
+    def get(self):
+        now = self.clock()
+        if self._token and now < self._expires_at:
+            return self._token
+        credential = self.credentials.get()
+        # RFC 6749 client_secret_basic form-encodes each credential before base64.
+        client_id = urllib.parse.quote_plus(credential.username)
+        client_secret = urllib.parse.quote_plus(credential.password)
+        basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        request = urllib.request.Request(self.token_url,
+            data=urllib.parse.urlencode({"grant_type": "client_credentials", "scope": self.scope}).encode(),
+            headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST")
+        try:
+            with self.opener(request, timeout=self.timeout) as response:
+                value = json.loads(response.read(65537))
+            token, lifetime = value["access_token"], value["expires_in"]
+            if (not isinstance(value.get("token_type"), str)
+                    or value["token_type"].lower() != "bearer" or not isinstance(token, str)
+                    or not re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token)
+                    or isinstance(lifetime, bool) or not isinstance(lifetime, (int, float))
+                    or not 0 < lifetime <= 86400):
+                raise ValueError("Invalid token response")
+        except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as error:
+            self.invalidate()
+            raise ProviderUnavailable("OAuth token exchange failed") from error
+        self._token = token
+        self._expires_at = now + max(0, lifetime - 30)
+        return token
+
+    def invalidate(self):
+        self._token, self._expires_at = None, 0.0
+        self.credentials.invalidate()
+
+
 class BenefitCheckerClient:
-    def __init__(self, base_url: str, credentials: SecretCredentialProvider, timeout: float = 5.0, opener=None):
+    def __init__(self, base_url: str, credentials: SecretCredentialProvider, timeout: float = 5.0, opener=None, token_provider=None):
         self.url = f"{base_url.rstrip('/')}{ASSESSMENT_PATH}"
         self.credentials = credentials
         self.timeout = timeout
-        self.opener = opener or urllib.request.urlopen
+        self.opener = opener or urllib.request.build_opener(NoRedirect()).open
+        self.token_provider = token_provider
 
     def assess(self, payload: dict[str, Any], correlation_id: str) -> ProviderResponse:
         response = self._send(payload, correlation_id)
-        if response.status in {401, 403}:
-            self.credentials.invalidate()
+        if response.status == 401:
+            (self.token_provider or self.credentials).invalidate()
             response = self._send(payload, correlation_id)
         elif response.status in RETRYABLE_STATUSES:
             response = self._send(payload, correlation_id)
         return response
 
     def _send(self, payload: dict[str, Any], correlation_id: str) -> ProviderResponse:
-        credentials = self.credentials.get()
-        token = base64.b64encode(f"{credentials.username}:{credentials.password}".encode()).decode()
+        if self.token_provider:
+            authorization = f"Bearer {self.token_provider.get()}"
+        else:
+            credentials = self.credentials.get()
+            token = base64.b64encode(f"{credentials.username}:{credentials.password}".encode()).decode()
+            authorization = f"Basic {token}"
         request = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode(),
             headers={
-                "authorization": f"Basic {token}",
+                "authorization": authorization,
                 "content-type": "application/json",
                 "accept": "application/json",
                 "x-correlation-id": correlation_id,
@@ -164,7 +224,18 @@ def _build_client() -> BenefitCheckerClient:
         ttl = int(os.getenv("SECRET_CACHE_TTL_SECONDS", "300"))
     except ValueError as error:
         raise ConfigurationError("Downstream timeout or secret cache TTL is invalid") from error
-    return BenefitCheckerClient(base_url, SecretCredentialProvider(secret_id, ttl), timeout)
+    credentials = SecretCredentialProvider(secret_id, ttl)
+    mode = os.getenv("DOWNSTREAM_AUTH_MODE", "basic")
+    if mode not in {"basic", "oauth2"}:
+        raise ConfigurationError("Unknown downstream authentication mode")
+    token_provider = None
+    if mode == "oauth2":
+        if urllib.parse.urlsplit(base_url).scheme != "https":
+            raise ConfigurationError("OAuth downstream endpoint must use HTTPS")
+        token_provider = OAuthClientCredentialsProvider(
+            os.getenv("DOWNSTREAM_OAUTH2_TOKEN_URL", ""),
+            os.getenv("DOWNSTREAM_OAUTH2_SCOPE", ""), credentials, timeout)
+    return BenefitCheckerClient(base_url, credentials, timeout, token_provider=token_provider)
 
 
 _CLIENT: BenefitCheckerClient | None = None
